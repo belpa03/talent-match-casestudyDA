@@ -1,0 +1,414 @@
+-- ==========================================
+-- 🎯 STEP 2: TALENT MATCHING SQL QUERY (FIXED)
+-- ==========================================
+-- All bugs fixed, with adjustable thresholds
+-- ==========================================
+
+-- ==========================================
+-- SECTION 1: CREATE TABLES
+-- ==========================================
+
+-- Table 1: TGV-TV Mapping (10 competency pillars grouped into 3 categories)
+CREATE TABLE IF NOT EXISTS case_studyDA.tgv_tv_mapping (
+    tv_code VARCHAR(10) PRIMARY KEY,
+    tv_name VARCHAR(255) NOT NULL,
+    tv_weight NUMERIC(6,4) NOT NULL,
+    tgv_category VARCHAR(100) NOT NULL,
+    tgv_display_order INT NOT NULL,
+    description TEXT
+);
+
+-- Insert mappings with ACTUAL feature importance weights
+INSERT INTO case_studyDA.tgv_tv_mapping (tv_code, tv_name, tv_weight, tgv_category, tgv_display_order, description) VALUES
+-- TGV 1: Execution Excellence (37.78%)
+('QDD', 'Quality-Driven Delivery', 0.1377, 'Execution Excellence', 1, 'Excellence in execution, attention to detail'),
+('STO', 'Strategic & Tactical Operations', 0.1003, 'Execution Excellence', 1, 'Strategic planning and operational execution'),
+('GDR', 'Goal Delivery & Results', 0.0900, 'Execution Excellence', 1, 'Achieving objectives and driving outcomes'),
+('CSI', 'Customer Service & Impact', 0.0828, 'Execution Excellence', 1, 'Service excellence and issue resolution'),
+
+-- TGV 2: Strategic Capability (28.38%)
+('FTC', 'Future Thinking & Change', 0.1067, 'Strategic Capability', 2, 'Innovation, adaptability, change leadership'),
+('IDS', 'Innovation & Development', 0.0864, 'Strategic Capability', 2, 'Creating solutions, continuous improvement'),
+('LIE', 'Leadership Impact & Engagement', 0.0811, 'Strategic Capability', 2, 'Leading teams, influencing stakeholders'),
+('CEX', 'Customer Experience', 0.0663, 'Strategic Capability', 2, 'Building relationships, understanding needs'),
+
+-- TGV 3: People & Culture Alignment (27.37%)
+('SEA', 'Self-Awareness & EQ', 0.0937, 'People & Culture Alignment', 3, 'Emotional intelligence, self-insight'),
+('VCU', 'Values & Culture', 0.0909, 'People & Culture Alignment', 3, 'Organizational alignment, cultural contribution')
+
+ON CONFLICT (tv_code) DO UPDATE SET
+    tv_name = EXCLUDED.tv_name,
+    tv_weight = EXCLUDED.tv_weight,
+    tgv_category = EXCLUDED.tgv_category,
+    description = EXCLUDED.description;
+
+-- Verify total weights (should be 93.59%)
+SELECT 
+    SUM(tv_weight) AS total_weight,
+    ROUND((SUM(tv_weight) * 100)::numeric, 2) AS total_percentage,
+    COUNT(*) AS tv_count
+FROM case_studyDA.tgv_tv_mapping;
+
+
+-- Table 2: Talent Benchmarks (stores job vacancies and benchmark employees)
+CREATE TABLE IF NOT EXISTS case_studyDA.talent_benchmarks (
+    job_vacancy_id VARCHAR(50) PRIMARY KEY,
+    role_name VARCHAR(255) NOT NULL,
+    job_level VARCHAR(100),
+    role_purpose TEXT,
+    selected_talent_ids TEXT[] NOT NULL,
+    weights_config JSONB DEFAULT '{}'::jsonb,
+    created_at TIMESTAMP DEFAULT NOW(),
+    created_by VARCHAR(100)
+);
+
+
+-- ==========================================
+-- SECTION 2: INSERT SAMPLE VACANCY
+-- Auto-selects Rating 5 employees as benchmarks
+-- ==========================================
+
+WITH top_performers AS (
+    SELECT DISTINCT e.employee_id, e.fullname
+    FROM case_studyDA.performance_yearly p
+    JOIN case_studyDA.employees e ON p.employee_id = e.employee_id
+    WHERE p.rating = 5
+      AND p.year = (SELECT MAX(year) FROM case_studyDA.performance_yearly)
+    ORDER BY e.employee_id
+    LIMIT 10 -- Select 10 benchmark employees
+)
+INSERT INTO case_studyDA.talent_benchmarks (
+    job_vacancy_id, 
+    role_name, 
+    job_level, 
+    role_purpose, 
+    selected_talent_ids, 
+    created_by
+)
+SELECT 
+    'VAC-2025-001',
+    'Senior Business Analyst',
+    'Grade IV-V',
+    'Drive strategic initiatives through data-driven insights and stakeholder collaboration',
+    ARRAY_AGG(employee_id ORDER BY employee_id),
+    'System'
+FROM top_performers
+ON CONFLICT (job_vacancy_id) DO UPDATE SET
+    selected_talent_ids = EXCLUDED.selected_talent_ids,
+    created_at = NOW();
+
+-- Verify what was inserted
+SELECT 
+    job_vacancy_id,
+    role_name,
+    job_level,
+    ARRAY_LENGTH(selected_talent_ids, 1) AS benchmark_count,
+    selected_talent_ids
+FROM case_studyDA.talent_benchmarks
+WHERE job_vacancy_id = 'VAC-2025-001';
+
+
+-- ==========================================
+-- SECTION 3: MAIN MATCHING QUERY
+-- 4-Step Algorithm Implementation
+-- ==========================================
+
+WITH 
+
+-- Input parameters
+vacancy_input AS (
+    SELECT * 
+    FROM case_studyDA.talent_benchmarks
+    WHERE job_vacancy_id = 'VAC-2025-001' -- 🔧 CHANGE THIS for different vacancies
+),
+
+-- Get latest assessment year
+latest_year AS (
+    SELECT MAX(year) AS max_year 
+    FROM case_studyDA.competencies_yearly
+),
+
+-- ==========================================
+-- STEP 1: BASELINE AGGREGATION
+-- Calculate MEDIAN score for each TV from benchmark employees
+-- ==========================================
+
+tv_baseline AS (
+    SELECT
+        c.pillar_code AS tv_code,
+        m.tv_name,
+        m.tgv_category,
+        m.tv_weight,
+        
+        -- MEDIAN as baseline (50th percentile)
+        PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY c.score) AS baseline_score,
+        
+        -- Additional statistics
+        COUNT(DISTINCT c.employee_id) AS benchmark_employee_count,
+        ROUND(AVG(c.score)::numeric, 2) AS baseline_avg,
+        ROUND(MIN(c.score)::numeric, 2) AS baseline_min,
+        ROUND(MAX(c.score)::numeric, 2) AS baseline_max,
+        ROUND(STDDEV(c.score)::numeric, 2) AS baseline_stddev
+        
+    FROM case_studyDA.competencies_yearly c
+    CROSS JOIN vacancy_input v
+    JOIN case_studyDA.tgv_tv_mapping m ON c.pillar_code = m.tv_code
+    WHERE 
+        c.year = (SELECT max_year FROM latest_year)
+        AND c.employee_id = ANY(v.selected_talent_ids)
+        AND c.score IS NOT NULL
+    GROUP BY c.pillar_code, m.tv_name, m.tgv_category, m.tv_weight
+),
+
+-- ==========================================
+-- STEP 2: TV MATCH RATE
+-- Compare each candidate's score against baseline
+-- Formula: (user_score / baseline_score) × 100
+-- ==========================================
+
+tv_match_rate AS (
+    SELECT
+        c.employee_id,
+        c.pillar_code AS tv_code,
+        b.tv_name,
+        b.tgv_category,
+        c.score AS user_score,
+        b.baseline_score,
+        b.tv_weight,
+        b.baseline_avg,
+        b.baseline_min,
+        b.baseline_max,
+        b.baseline_stddev,
+        b.benchmark_employee_count,
+
+        -- TV Match Rate calculation
+        ROUND(
+            ((c.score / NULLIF(b.baseline_score, 0)) * 100)::numeric, 
+            1
+        ) AS tv_match_rate,
+
+        -- Score gap from baseline
+        ROUND((c.score - b.baseline_score)::numeric, 2) AS score_gap,
+
+        -- Performance classification
+        CASE
+            WHEN c.score >= b.baseline_score + COALESCE(b.baseline_stddev, 0) THEN 'Significantly Above'
+            WHEN c.score > b.baseline_score THEN 'Above Benchmark'
+            WHEN c.score = b.baseline_score THEN 'Meets Benchmark'
+            WHEN c.score >= b.baseline_score - COALESCE(b.baseline_stddev, 0) THEN 'Below Benchmark'
+            ELSE 'Significantly Below'
+        END AS performance_vs_benchmark
+
+    FROM case_studyDA.competencies_yearly c
+    JOIN tv_baseline b ON c.pillar_code = b.tv_code
+    WHERE 
+        c.year = (SELECT max_year FROM latest_year)
+        AND c.score IS NOT NULL
+),
+
+-- ==========================================
+-- STEP 3: TGV MATCH RATE (FIXED)
+-- Aggregate TV match rates within each TGV category
+-- ==========================================
+
+tgv_match_rate AS (
+    SELECT
+        tv.employee_id,
+        tv.tgv_category,
+
+        -- Weighted average of TV match rates
+        ROUND(
+            (SUM(tv.tv_match_rate * tv.tv_weight) / NULLIF(SUM(tv.tv_weight), 0))::numeric, 
+            1
+        ) AS tgv_match_rate,
+
+        -- Metadata
+        COUNT(*) AS tv_count_in_tgv,
+        SUM(tv.tv_weight) AS tgv_total_weight,
+        ROUND(AVG(tv.user_score)::numeric, 2) AS avg_user_score,
+        ROUND(AVG(tv.baseline_score)::numeric, 2) AS avg_baseline_score,
+        ROUND(AVG(tv.score_gap)::numeric, 2) AS avg_score_gap,
+        ROUND(MIN(tv.tv_match_rate)::numeric, 1) AS min_tv_match,
+        ROUND(MAX(tv.tv_match_rate)::numeric, 1) AS max_tv_match,
+
+        -- ✅ FIXED: Identify strength TVs (match rate >= 95%)
+        STRING_AGG(
+            tv.tv_name,
+            ', ' 
+            ORDER BY tv.tv_match_rate DESC
+        ) FILTER (WHERE tv.tv_match_rate >= 95) AS strength_tvs,
+
+        -- ✅ FIXED: Identify development TVs (match rate < 90%)
+        STRING_AGG(
+            tv.tv_name,
+            ', ' 
+            ORDER BY tv.tv_match_rate ASC
+        ) FILTER (WHERE tv.tv_match_rate < 90) AS development_tvs
+
+    FROM tv_match_rate tv
+    GROUP BY tv.employee_id, tv.tgv_category
+),
+
+-- ==========================================
+-- STEP 4: FINAL MATCH RATE
+-- Weighted sum across all TVs
+-- ==========================================
+
+final_match_rate AS (
+    SELECT
+        tv.employee_id,
+
+        -- Final Match Rate = Σ(tv_match_rate × tv_weight) / Σ(tv_weight)
+        ROUND(
+            (SUM(tv.tv_match_rate * tv.tv_weight) / NULLIF(SUM(tv.tv_weight), 0))::numeric, 
+            1
+        ) AS final_match_rate,
+
+        -- Summary statistics
+        COUNT(DISTINCT tv.tv_code) AS tv_evaluated_count,
+        COUNT(DISTINCT tv.tgv_category) AS tgv_count,
+        SUM(tv.tv_weight) AS total_weight_used,
+        ROUND(AVG(tv.user_score)::numeric, 2) AS overall_avg_score,
+        ROUND(AVG(tv.baseline_score)::numeric, 2) AS overall_baseline_score,
+        ROUND(MIN(tv.tv_match_rate)::numeric, 1) AS min_tv_match,
+        ROUND(MAX(tv.tv_match_rate)::numeric, 1) AS max_tv_match,
+        ROUND(STDDEV(tv.tv_match_rate)::numeric, 1) AS stddev_tv_match,
+
+        -- TGV-level summaries (for visualization)
+        ROUND(AVG(CASE WHEN tv.tgv_category = 'Execution Excellence' THEN tv.tv_match_rate END)::numeric, 1) AS execution_match,
+        ROUND(AVG(CASE WHEN tv.tgv_category = 'Strategic Capability' THEN tv.tv_match_rate END)::numeric, 1) AS strategic_match,
+        ROUND(AVG(CASE WHEN tv.tgv_category = 'People & Culture Alignment' THEN tv.tv_match_rate END)::numeric, 1) AS culture_match
+
+    FROM tv_match_rate tv
+    GROUP BY tv.employee_id
+)
+
+-- ==========================================
+-- FINAL OUTPUT: Complete Talent Match Report
+-- ==========================================
+
+SELECT
+    -- Vacancy Context
+    v.job_vacancy_id,
+    v.role_name AS vacancy_role,
+    v.job_level AS vacancy_level,
+    v.role_purpose,
+    ARRAY_LENGTH(v.selected_talent_ids, 1) AS benchmark_count,
+    v.selected_talent_ids AS benchmark_employee_ids,
+
+    -- Employee Identity
+    e.employee_id,
+    e.fullname,
+    e.nip,
+    e.years_of_service_months,
+    ROUND((e.years_of_service_months::numeric / 12), 1) AS years_of_service_years,
+
+    -- Organizational Context
+    COALESCE(dc.name, 'Unknown') AS company,
+    COALESCE(dd.name, 'Unknown') AS directorate,
+    COALESCE(dv.name, 'Unknown') AS division,
+    COALESCE(dp.name, 'Unknown') AS department,
+    COALESCE(dpos.name, 'Unknown') AS position,
+    COALESCE(dg.name, 'Unknown') AS grade,
+    COALESCE(ded.name, 'Unknown') AS education,
+    COALESCE(dm.name, 'Unknown') AS major,
+
+    -- TGV Level (3 categories)
+    tgv.tgv_category AS tgv_name,
+    tgv.tgv_match_rate,
+    tgv.tgv_total_weight,
+    tgv.tv_count_in_tgv,
+    tgv.avg_user_score AS tgv_avg_user_score,
+    tgv.avg_baseline_score AS tgv_avg_baseline_score,
+    tgv.avg_score_gap AS tgv_avg_gap,
+    tgv.min_tv_match AS tgv_min_tv,
+    tgv.max_tv_match AS tgv_max_tv,
+    tgv.strength_tvs,
+    tgv.development_tvs,
+
+    -- TV Level (10 pillars - detailed)
+    tv.tv_code AS tv_name,
+    tv.tv_name AS tv_label,
+    tv.baseline_score,
+    tv.user_score,
+    tv.tv_match_rate,
+    tv.tv_weight,
+    tv.score_gap,
+    tv.performance_vs_benchmark,
+    tv.baseline_avg,
+    tv.baseline_min,
+    tv.baseline_max,
+    tv.baseline_stddev,
+    tv.benchmark_employee_count,
+
+    -- TV contribution to final score
+    ROUND(((tv.tv_match_rate * tv.tv_weight) / 0.9359)::numeric, 2) AS tv_contribution_to_final,
+
+    -- Final Score (PRIMARY RANKING METRIC)
+    fm.final_match_rate,
+    fm.tv_evaluated_count,
+    fm.tgv_count,
+    fm.total_weight_used,
+    fm.overall_avg_score,
+    fm.overall_baseline_score,
+    fm.min_tv_match AS overall_min_tv,
+    fm.max_tv_match AS overall_max_tv,
+    fm.stddev_tv_match,
+
+    -- TGV Summary (for radar charts)
+    fm.execution_match,
+    fm.strategic_match,
+    fm.culture_match,
+
+    -- Classification & Status
+    CASE 
+        WHEN e.employee_id = ANY(v.selected_talent_ids) THEN 'Benchmark Talent'
+        ELSE 'Candidate'
+    END AS benchmark_status,
+
+    CASE 
+        WHEN fm.final_match_rate >= 100 THEN 'Perfect Match (≥100%)'
+        WHEN fm.final_match_rate >= 95 THEN 'Excellent Match (95-99%)'
+        WHEN fm.final_match_rate >= 85 THEN 'Good Match (85-94%)'
+        WHEN fm.final_match_rate >= 70 THEN 'Moderate Match (70-84%)'
+        WHEN fm.final_match_rate >= 50 THEN 'Low Match (50-69%)'
+        ELSE 'Poor Match (<50%)'
+    END AS match_category,
+
+    -- Recommendation
+    CASE 
+        WHEN e.employee_id = ANY(v.selected_talent_ids) THEN 'Benchmark - Success Profile Reference'
+        WHEN fm.final_match_rate >= 95 THEN 'IMMEDIATE CONSIDERATION - Schedule interview'
+        WHEN fm.final_match_rate >= 85 THEN 'STRONG CANDIDATE - Include in shortlist'
+        WHEN fm.final_match_rate >= 70 THEN 'POTENTIAL - Consider with development'
+        WHEN fm.final_match_rate >= 50 THEN 'DEVELOPMENT NEEDED - Not ready'
+        ELSE 'NOT RECOMMENDED - Significant gaps'
+    END AS recommendation
+
+FROM final_match_rate fm
+CROSS JOIN vacancy_input v
+JOIN case_studyDA.employees e ON fm.employee_id = e.employee_id
+
+-- Join dimension tables
+LEFT JOIN case_studyDA.dim_companies dc ON e.company_id = dc.company_id
+LEFT JOIN case_studyDA.dim_directorates dd ON e.directorate_id = dd.directorate_id
+LEFT JOIN case_studyDA.dim_divisions dv ON e.division_id = dv.division_id
+LEFT JOIN case_studyDA.dim_departments dp ON e.department_id = dp.department_id
+LEFT JOIN case_studyDA.dim_positions dpos ON e.position_id = dpos.position_id
+LEFT JOIN case_studyDA.dim_grades dg ON e.grade_id = dg.grade_id
+LEFT JOIN case_studyDA.dim_educations ded ON e.education_id = ded.education_id
+LEFT JOIN case_studyDA.dim_majors dm ON e.major_id = dm.major_id
+
+-- Join TGV and TV data
+JOIN tgv_match_rate tgv ON tgv.employee_id = fm.employee_id
+JOIN tv_match_rate tv ON tv.employee_id = fm.employee_id 
+    AND tv.tgv_category = tgv.tgv_category
+
+-- Order by best matches first
+ORDER BY 
+    fm.final_match_rate DESC,
+    e.employee_id,
+    tgv.tgv_category,
+    tv.tv_weight DESC;
+
+
