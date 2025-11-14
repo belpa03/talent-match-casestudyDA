@@ -60,9 +60,4 @@ Output includes:
 - AI-generated job profile  
 - Clear insights for non-technical stakeholders  
 
-The app is deployed publicly for review.
-
----
-
-## 📁 Repository Structure  
 
